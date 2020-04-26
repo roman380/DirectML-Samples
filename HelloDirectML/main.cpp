@@ -189,12 +189,13 @@ namespace DML
 			WINRT_ASSERT(Dispatchable);
 			WINRT_ASSERT(!DescriptorCount || DescriptorOffset + DescriptorCount <= m_DescriptorCount);
 			WINRT_ASSERT(m_Value);
+			// NOTE: Descriptor Handles https://docs.microsoft.com/en-us/windows/win32/direct3d12/creating-descriptor-heaps#descriptor-handles
 			CD3DX12_CPU_DESCRIPTOR_HANDLE CpuDescriptorHandle(m_StartCpuDescriptorHandle, DescriptorOffset, m_CbvSrvUavDescriptorSize);
 			CD3DX12_GPU_DESCRIPTOR_HANDLE GpuDescriptorHandle(m_StartGpuDescriptorHandle, DescriptorOffset, m_CbvSrvUavDescriptorSize);
 			m_Desc.Dispatchable = Dispatchable;
 			m_Desc.CPUDescriptorHandle = CpuDescriptorHandle;
 			m_Desc.GPUDescriptorHandle = GpuDescriptorHandle;
-			m_Desc.SizeInDescriptors = DescriptorCount ? DescriptorCount : m_DescriptorCount - DescriptorOffset;
+			m_Desc.SizeInDescriptors = m_DescriptorCount - DescriptorOffset;
 			check_hresult(m_Value->Reset(&m_Desc));
 		}
 		void BindInput(DML_BINDING_DESC const& Input) const
@@ -329,6 +330,8 @@ namespace DML
 			for(size_t Index = 0; Index < t_Count; Index++)
 			{
 				const Item& Item = m_Items[Index];
+				// TODO: This is probably wrong; this could have worked out in original asmple with just initialize/execute resource sharing but here different operators
+				//       are likely to have dedicated resources which do not collide
 				m_Buffers.m_TemporaryResourceSize = std::max(m_Buffers.m_TemporaryResourceSize, Item.m_ExecuteProperties.TemporaryResourceSize);
 				m_Buffers.m_PersistentResourceSize = std::max(m_Buffers.m_PersistentResourceSize, Item.m_ExecuteProperties.PersistentResourceSize);
 			}
@@ -449,12 +452,7 @@ int wmain(int argc, char** argv)
 		BindingTable.BindOutputs(Outputs);
 		CommandRecorder.RecordDispatch(BindingTable, D3dContext);
 	}
-
-	// TODO: Something is still wrong here; I would like to record next dispatch into the same execution context without waiting but it looks like I am doing something wrong with binding tables,
-	//       perhaps I need separate tables for operators and resetting here does not work as expected even though separate heap descriptors are used; perhaps the problem is in sharing resources?
-	D3dContext.ExecuteCommandListAndWait();
-
-	DescriptorHeap.Set(D3dContext);
+	D3dContext.ResourceBarrier(CD3DX12_RESOURCE_BARRIER::UAV(IntermediateBuffer.get()));
 	{
 		auto const& Operator = Operators.m_Items[1]; // Multiply
 		BindingTable.Reset(Operator.m_CompiledOperator.get(), Operator.m_DescriptorOffset, Operator.m_ExecuteProperties.RequiredDescriptorCount); // Multiply
