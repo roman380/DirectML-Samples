@@ -1,5 +1,7 @@
 ﻿// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
+//
+// Refactoring and updated by Roman Ryltsov roman@alax.info
 
 #include "pch.h"
 
@@ -95,6 +97,12 @@ namespace D3D
 			const D3D12_DESCRIPTOR_HEAP_DESC DescriptorHeapDesc { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, DescriptorCount, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
 			check_hresult(Context.m_Device->CreateDescriptorHeap(&DescriptorHeapDesc, IID_PPV_ARGS(m_Value.put())));
 		}
+		void Set(Context const& Context)
+		{
+			WINRT_ASSERT(Context.m_CommandList);
+			ID3D12DescriptorHeap* DescriptorHeaps[] { m_Value.get() };
+			Context.m_CommandList->SetDescriptorHeaps(static_cast<UINT>(std::size(DescriptorHeaps)), DescriptorHeaps);
+		}
 		ID3D12DescriptorHeap* operator -> () const 
 		{
 			WINRT_ASSERT(m_Value);
@@ -154,25 +162,39 @@ namespace DML
 	class BindingTable
 	{
 	public:
+		UINT m_CbvSrvUavDescriptorSize;
+		CD3DX12_CPU_DESCRIPTOR_HANDLE m_StartCpuDescriptorHandle;
+		CD3DX12_GPU_DESCRIPTOR_HANDLE m_StartGpuDescriptorHandle;
+		UINT m_DescriptorCount;
 		DML_BINDING_TABLE_DESC m_Desc { };
 		com_ptr<IDMLBindingTable> m_Value;
 
 	public:
-		BindingTable(com_ptr<IDMLDevice> const& Device, D3D::DescriptorHeap const& DescriptorHeap, UINT DescriptorCount, IDMLDispatchable* Dispatchable)
+		BindingTable(D3D::Context const& Context, D3D::DescriptorHeap const& DescriptorHeap, UINT DescriptorCount, com_ptr<IDMLDevice> const& Device, IDMLDispatchable* Dispatchable) :
+			m_CbvSrvUavDescriptorSize(Context.m_Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)),
+			m_StartCpuDescriptorHandle(DescriptorHeap->GetCPUDescriptorHandleForHeapStart()),
+			m_StartGpuDescriptorHandle(DescriptorHeap->GetGPUDescriptorHandleForHeapStart()),
+			m_DescriptorCount(DescriptorCount)
 		{
 			WINRT_ASSERT(Device);
 			WINRT_ASSERT(Dispatchable);
 			m_Desc.Dispatchable = Dispatchable;
-			m_Desc.CPUDescriptorHandle = DescriptorHeap->GetCPUDescriptorHandleForHeapStart();
-			m_Desc.GPUDescriptorHandle = DescriptorHeap->GetGPUDescriptorHandleForHeapStart();
-			m_Desc.SizeInDescriptors = DescriptorCount;
+			m_Desc.CPUDescriptorHandle = m_StartCpuDescriptorHandle;
+			m_Desc.GPUDescriptorHandle = m_StartGpuDescriptorHandle;
+			m_Desc.SizeInDescriptors = m_DescriptorCount;
 			check_hresult(Device->CreateBindingTable(&m_Desc, IID_PPV_ARGS(m_Value.put())));
 		}
-		void Reset(IDMLDispatchable* Dispatchable)
+		void Reset(IDMLDispatchable* Dispatchable, UINT DescriptorOffset, UINT DescriptorCount)
 		{
 			WINRT_ASSERT(Dispatchable);
+			WINRT_ASSERT(!DescriptorCount || DescriptorOffset + DescriptorCount <= m_DescriptorCount);
 			WINRT_ASSERT(m_Value);
+			CD3DX12_CPU_DESCRIPTOR_HANDLE CpuDescriptorHandle(m_StartCpuDescriptorHandle, DescriptorOffset, m_CbvSrvUavDescriptorSize);
+			CD3DX12_GPU_DESCRIPTOR_HANDLE GpuDescriptorHandle(m_StartGpuDescriptorHandle, DescriptorOffset, m_CbvSrvUavDescriptorSize);
 			m_Desc.Dispatchable = Dispatchable;
+			m_Desc.CPUDescriptorHandle = CpuDescriptorHandle;
+			m_Desc.GPUDescriptorHandle = GpuDescriptorHandle;
+			m_Desc.SizeInDescriptors = DescriptorCount ? DescriptorCount : m_DescriptorCount - DescriptorOffset;
 			check_hresult(m_Value->Reset(&m_Desc));
 		}
 		void BindInput(DML_BINDING_DESC const& Input) const
@@ -219,7 +241,7 @@ namespace DML
 	};
 
 	template <size_t t_Count>
-	class Operator
+	class Operators
 	{
 	public:
 
@@ -230,6 +252,7 @@ namespace DML
 			DML_EXECUTION_FLAGS m_Flags = DML_EXECUTION_FLAG_NONE;
 			com_ptr<IDMLCompiledOperator> m_CompiledOperator;
 			DML_BINDING_PROPERTIES m_ExecuteProperties;
+			UINT m_DescriptorOffset;
 		};
 
 		class Buffers
@@ -267,7 +290,7 @@ namespace DML
 		Buffers m_Buffers;
 
 	public:
-		Operator() = default;
+		Operators() = default;
 		void Compile(com_ptr<IDMLDevice> const& Device, DML_EXECUTION_FLAGS Flags = DML_EXECUTION_FLAG_NONE)
 		{
 			WINRT_ASSERT(Device);
@@ -288,14 +311,14 @@ namespace DML
 			// You need to initialize an operator exactly once before it can be executed, and the two stages require different numbers of descriptors for binding. 
 			// For simplicity, we create a single descriptor heap that's large enough to satisfy them both.
 			m_InitializeProperties = m_OperatorInitializer->GetBindingProperties();
-			UINT RequiredExecuteDescriptorCount = 0;
+			m_DescriptorCount = m_InitializeProperties.RequiredDescriptorCount;
 			for(size_t Index = 0; Index < t_Count; Index++)
 			{
 				Item& Item = m_Items[Index];
 				Item.m_ExecuteProperties = Item.m_CompiledOperator->GetBindingProperties();
-				RequiredExecuteDescriptorCount = std::max(RequiredExecuteDescriptorCount, Item.m_ExecuteProperties.RequiredDescriptorCount);
+				Item.m_DescriptorOffset = m_DescriptorCount;
+				m_DescriptorCount += Item.m_ExecuteProperties.RequiredDescriptorCount;
 			}
-			m_DescriptorCount = std::max(m_InitializeProperties.RequiredDescriptorCount, RequiredExecuteDescriptorCount);
 		}
 		void CreateBuffers(D3D::Context const& Context)
 		{
@@ -362,37 +385,29 @@ int wmain(int argc, char** argv)
 	}
 	const UINT64 TensorBufferSize { DmlBufferTensorDesc.TotalTensorSizeInBytes };
 
-	DML::Operator<1> AddOperator;
+	DML::Operators<2> Operators;
 	{
 		DML_TENSOR_DESC TensorDesc { DML_TENSOR_TYPE_BUFFER, &DmlBufferTensorDesc };
 		DML_ELEMENT_WISE_ADD_OPERATOR_DESC AddOperatorDesc { &TensorDesc, &TensorDesc, &TensorDesc};
 		DML_OPERATOR_DESC OperatorDesc { DML_OPERATOR_ELEMENT_WISE_ADD, &AddOperatorDesc };
-		check_hresult(DmlDevice->CreateOperator(&OperatorDesc, IID_PPV_ARGS(AddOperator.m_Items[0].m_Operator.put())));
+		check_hresult(DmlDevice->CreateOperator(&OperatorDesc, IID_PPV_ARGS(Operators.m_Items[0].m_Operator.put())));
 	}
-	AddOperator.Compile(DmlDevice);
-	AddOperator.CreateBuffers(D3dContext);
-	DML::Operator<1> MultiplyOperator;
 	{
 		DML_TENSOR_DESC TensorDesc { DML_TENSOR_TYPE_BUFFER, &DmlBufferTensorDesc };
 		DML_ELEMENT_WISE_MULTIPLY_OPERATOR_DESC MultiplyOperatorDesc { &TensorDesc, &TensorDesc, &TensorDesc};
 		DML_OPERATOR_DESC OperatorDesc { DML_OPERATOR_ELEMENT_WISE_MULTIPLY, &MultiplyOperatorDesc };
-		check_hresult(DmlDevice->CreateOperator(&OperatorDesc, IID_PPV_ARGS(MultiplyOperator.m_Items[0].m_Operator.put())));
+		check_hresult(DmlDevice->CreateOperator(&OperatorDesc, IID_PPV_ARGS(Operators.m_Items[1].m_Operator.put())));
 	}
-	MultiplyOperator.Compile(DmlDevice);
-	MultiplyOperator.CreateBuffers(D3dContext);
+	Operators.Compile(DmlDevice);
+	Operators.CreateBuffers(D3dContext);
 
-	D3D::DescriptorHeap DescriptorHeap(D3dContext, AddOperator.m_DescriptorCount + MultiplyOperator.m_DescriptorCount);
-	ID3D12DescriptorHeap* DescriptorHeaps[] { DescriptorHeap.m_Value.get() };
-
-	DML::BindingTable AddBindingTable(DmlDevice, DescriptorHeap, AddOperator.m_DescriptorCount, AddOperator.m_OperatorInitializer.get());
-	AddOperator.m_Buffers.BindToInitialize(AddBindingTable);
-
-	DML::BindingTable MultiplyBindingTable(DmlDevice, DescriptorHeap, MultiplyOperator.m_DescriptorCount, MultiplyOperator.m_OperatorInitializer.get());
-	MultiplyOperator.m_Buffers.BindToInitialize(MultiplyBindingTable);
-
+	D3D::DescriptorHeap DescriptorHeap(D3dContext, Operators.m_DescriptorCount);
+	DML::BindingTable BindingTable(D3dContext, DescriptorHeap, Operators.m_DescriptorCount, DmlDevice, Operators.m_OperatorInitializer.get());
 	DML::CommandRecorder CommandRecorder { DmlDevice };
-	CommandRecorder.RecordDispatch(AddBindingTable, D3dContext);
-	CommandRecorder.RecordDispatch(MultiplyBindingTable, D3dContext);
+
+	Operators.m_Buffers.BindToInitialize(BindingTable);
+	DescriptorHeap.Set(D3dContext);
+	CommandRecorder.RecordDispatch(BindingTable, D3dContext);
 
 	// Close the Direct3D 12 command list, and submit it for execution as you would any other command list. You could in principle record the execution into the same command list as the initialization, 
 	// but you need only to Initialize once, and typically you want to Execute an operator more frequently than that.
@@ -422,27 +437,32 @@ int wmain(int argc, char** argv)
 	}
 	#pragma endregion
 
-	D3dContext.m_CommandList->SetDescriptorHeaps(static_cast<UINT>(std::size(DescriptorHeaps)), DescriptorHeaps);
+	Operators.m_Buffers.BindToExecute(BindingTable);
+
+	DescriptorHeap.Set(D3dContext);
 	{
-		AddBindingTable.Reset(AddOperator.m_Items[0].m_CompiledOperator.get()); // Add
+		auto const& Operator = Operators.m_Items[0]; // Add
+		BindingTable.Reset(Operator.m_CompiledOperator.get(), Operator.m_DescriptorOffset, Operator.m_ExecuteProperties.RequiredDescriptorCount);
 		DML_BINDING_DESC Inputs[] { DML::BufferBindingDesc(InputBuffer, TensorBufferSize), DML::BufferBindingDesc(InputBuffer, TensorBufferSize) };
-		AddBindingTable.BindInputs(Inputs);
+		BindingTable.BindInputs(Inputs);
 		DML_BINDING_DESC Outputs[] { DML::BufferBindingDesc(IntermediateBuffer, TensorBufferSize) };
-		AddBindingTable.BindOutputs(Outputs);
-		AddOperator.m_Buffers.BindToExecute(AddBindingTable);
-		CommandRecorder.RecordDispatch(AddBindingTable, D3dContext);
+		BindingTable.BindOutputs(Outputs);
+		CommandRecorder.RecordDispatch(BindingTable, D3dContext);
 	}
+
+	// TODO: Something is still wrong here; I would like to record next dispatch into the same execution context without waiting but it looks like I am doing something wrong with binding tables,
+	//       perhaps I need separate tables for operators and resetting here does not work as expected even though separate heap descriptors are used; perhaps the problem is in sharing resources?
 	D3dContext.ExecuteCommandListAndWait();
 
-	D3dContext.m_CommandList->SetDescriptorHeaps(static_cast<UINT>(std::size(DescriptorHeaps)), DescriptorHeaps);
+	DescriptorHeap.Set(D3dContext);
 	{
-		MultiplyBindingTable.Reset(MultiplyOperator.m_Items[0].m_CompiledOperator.get()); // Multiply
+		auto const& Operator = Operators.m_Items[1]; // Multiply
+		BindingTable.Reset(Operator.m_CompiledOperator.get(), Operator.m_DescriptorOffset, Operator.m_ExecuteProperties.RequiredDescriptorCount); // Multiply
 		DML_BINDING_DESC Inputs[] { DML::BufferBindingDesc(IntermediateBuffer, TensorBufferSize), DML::BufferBindingDesc(IntermediateBuffer, TensorBufferSize) };
-		MultiplyBindingTable.BindInputs(Inputs);
+		BindingTable.BindInputs(Inputs);
 		DML_BINDING_DESC Outputs[] { DML::BufferBindingDesc(OutputBuffer, TensorBufferSize) };
-		MultiplyBindingTable.BindOutputs(Outputs);
-		MultiplyOperator.m_Buffers.BindToExecute(MultiplyBindingTable);
-		CommandRecorder.RecordDispatch(MultiplyBindingTable, D3dContext);
+		BindingTable.BindOutputs(Outputs);
+		CommandRecorder.RecordDispatch(BindingTable, D3dContext);
 	}
 //	D3dContext.ExecuteCommandListAndWait();
 
@@ -456,6 +476,7 @@ int wmain(int argc, char** argv)
 			D3D12_RANGE Range { 0, TensorBufferSize };
 			FLOAT* Data;
 			check_hresult(ReadbackBuffer->Map(0, &Range, reinterpret_cast<void**>(&Data)));
+			WINRT_ASSERT(fabs(*Data - 9.0f) < 1E-6); // (1.5 * 2) ^ 2 == 9.0
 			std::wcout << L"output tensor: ";
 			for(size_t Index = 0; Index < g_TensorElementCount; ++Index, ++Data)
 				std::wcout << *Data << L' ';
@@ -465,5 +486,4 @@ int wmain(int argc, char** argv)
 		}
 	}
 	#pragma endregion 
-	GetTickCount();
 }
